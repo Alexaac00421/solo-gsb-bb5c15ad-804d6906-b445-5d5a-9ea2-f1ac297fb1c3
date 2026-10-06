@@ -123,7 +123,8 @@ CREATE TABLE IF NOT EXISTS delivery_attempts (
 -- 不再入列。每个 (delivery_id, mailbox) 至多一行：领取时插入，到期重领时整体轮换
 -- （新令牌、新序号，completed_at/result 复位），旧令牌立即失效；凭有效令牌提交回执时
 -- 原子写入 delivery_attempts 并把 completed_at 置位（结束租约）。
--- 有效租约 = completed_at IS NULL 且 lease_expires_at > 当前时刻，且未被不早于
+-- 有效租约 = completed_at IS NULL 且 lease_expires_at > 当前时刻（按实际时刻
+-- 微秒精度比较，不做秒级截断），且未被不早于
 -- 租约序号的回执（delivery_attempts 中 attempt_no >= 租约序号）取代——被取代的
 -- 租约行不再阻塞入列，该终点按最新回执重算到期时刻后即可重领；并发领取经
 -- BEGIN IMMEDIATE 串行化，同一终点的有效租约不会被重复分配。
@@ -133,7 +134,7 @@ CREATE TABLE IF NOT EXISTS endpoint_leases (
     mailbox          TEXT NOT NULL,                    -- 判定终点邮箱（规范化小写）
     attempt_no       INTEGER NOT NULL CHECK (attempt_no >= 1),   -- 本次领取的下一尝试序号
     leased_at        TEXT NOT NULL,
-    lease_expires_at TEXT NOT NULL,                   -- 租约到期时刻（到期后可被重新领取）
+    lease_expires_at TEXT NOT NULL,                   -- 租约到期时刻（实际领取时刻 + 租约秒数，微秒精度；到期后可被重新领取）
     completed_at     TEXT,                            -- 凭有效令牌提交回执的时刻；NULL=未结束
     result           TEXT CHECK (result IN ('temporary_failure', 'permanent_failure', 'delivered')),
     UNIQUE (delivery_id, mailbox)

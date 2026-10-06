@@ -84,6 +84,9 @@
   到期（下一序号 +1）；最新回执为 `delivered` / `permanent_failure` 的终点**不再入列**；
   路由失败判定没有终点，从不入列。核对与领取在单个 `BEGIN IMMEDIATE` 事务内完成：
   **并发领取不会重复分配有效租约**；到期终点可被重新领取且**旧令牌立即失效**。
+  **租约到期点按实际领取时刻 + 请求的租约秒数以微秒精度确定**（不做秒级截断）：
+  到期前同一终点不可重领，有效令牌可完成并写入一次回执，到期后才允许重领；
+  域名在途计数使用相同的有效期判断。
   **已被不早于租约序号的回执取代的租约行视为失效**：不再阻塞入列，该终点按最新回执
   重算到期时刻与下一尝试序号（退避未到不返回，到期即可重领并轮换令牌），不会把
   已被直接回执取代的重试拖延到旧租约期满。
@@ -931,8 +934,8 @@ curl -X POST http://localhost:8000/deliveries/claims -H 'Content-Type: applicati
 - `attempt_no`：**下一尝试序号**——无回执时为 `1`；最新回执为 `temporary_failure`
   （序号 N）时为 `N + 1`。
 - `due_at`：该终点本次的到期时刻（UTC ISO 8601）。
-- `lease_expires_at`：本次租约到期时刻（领取时刻 + `lease_seconds`）；
-  租约有效期内该终点不会再被分配给任何人。
+- `lease_expires_at`：本次租约到期时刻（**实际领取时刻 + `lease_seconds`，微秒精度，
+  不做秒级截断**）；租约有效期内该终点不会再被分配给任何人。
 - `token`：租约令牌（32 位十六进制），完成回执时使用。
 - **暂无到期项** → `200 {"tasks": []}`；`max_claims` 或 `lease_seconds` 越界 / 缺失 → `422`。
 - 若管理员为**终点邮箱域名**配置了同时在途领取数上限，满额域名的任务会被跳过、继续领取
@@ -1080,6 +1083,52 @@ curl -X POST http://localhost:8000/deliveries/claims -H 'Content-Type: applicati
 #      "attempt_no": 2, "token": "a0f2db10…", ...}]}
 ```
 
+### 22.2 本轮变动：租约到期点按实际领取时刻计算（秒末领取不提前到期）
+
+**问题**：领取与完成的租约时间比较都按秒截断。在秒末（如 `xx:xx:00.9`）申请
+1 秒租约时，到期点被截断到下一个整秒，实际有效期只剩零头——约 0.2 秒后原令牌
+完成即报 `409 invalid_lease_token / expired`，同一终点在租约期内即可被重领，
+域名在途名额也被提前释放。
+
+**修复**：租约到期点一律按**实际领取时刻 + 请求的租约秒数（1～3600）**以微秒精度
+确定与比较，领取排除、域名在途计数与令牌完成三处使用同一时间基点与精度：
+
+- 到期前：同一终点不可重领，域名在途名额不释放，有效令牌可完成并写入一次回执；
+- 到期后：终点允许重领并轮换令牌，旧令牌提交报 `expired`（重领后为 `unknown`），
+  均不写入回执；
+- 完成、较新回执抢先取代（`superseded`）与撤销（`revoked`）释放名额的既有规则不变；
+- 领取 / 完成接口的请求、响应字段与 `409 invalid_lease_token` 的 `reason` 语义不变，
+  时间字段仍为 UTC ISO 8601（`lease_expires_at` 现可带小数秒，如
+  `2026-10-06T23:16:44.863285+00:00`）。
+
+调用示例（接口形状与第 19–21 节完全一致）：
+
+```bash
+# 1) 秒末领取 1 秒租约（假设实际领取时刻为 2026-10-06T23:16:43.863）
+curl -X POST http://localhost:8000/deliveries/claims -H 'Content-Type: application/json' \
+  -d '{"max_claims": 10, "lease_seconds": 1}'
+# => {"tasks": [{"delivery_id": "msg-lease-1", "mailbox": "alice@mail.example.com",
+#      "attempt_no": 1, "due_at": "2026-10-06T23:15:43+00:00",
+#      "lease_expires_at": "2026-10-06T23:16:44.863285+00:00",   # = 实际领取时刻 + 1 秒
+#      "token": "4960fafe…"}]}
+
+# 2) 约 0.2 秒后凭原令牌完成：200，原子写入一次回执（旧实现此处误报 expired）
+curl -X POST http://localhost:8000/deliveries/claims/4960fafe…/complete \
+  -H 'Content-Type: application/json' -d '{"result": "delivered"}'
+# => {"delivery_id": "msg-lease-1", "mailbox": "alice@mail.example.com",
+#     "attempt_no": 1, "result": "delivered", "created_at": "2026-10-06T23:16:44+00:00"}
+
+# 3) 租约期内再次领取：同一终点不可重领（域名在途名额同样未释放）
+curl -X POST http://localhost:8000/deliveries/claims -H 'Content-Type: application/json' \
+  -d '{"max_claims": 10, "lease_seconds": 1}'
+# => {"tasks": []}
+
+# 4) 越过真实到期点后：旧令牌报 expired 且不写回执；终点可重领并轮换令牌
+curl -X POST http://localhost:8000/deliveries/claims/4960fafe…/complete \
+  -H 'Content-Type: application/json' -d '{"result": "delivered"}'
+# => 409 {"detail": {"error": "invalid_lease_token", "reason": "expired", ...}}
+```
+
 ## 按终点邮箱域名限制同时在途领取数
 
 为避免某个接收域（如某家邮件服务商）被同时打太多发信连接，管理员可以按**终点邮箱的域名**
@@ -1136,7 +1185,8 @@ curl -X DELETE http://localhost:8000/deliveries/claims/domain-limits/mail.exampl
   在途占用：**已满额的域名 → 跳过这一项，继续往后领取其他域名**，直到凑满 `max_claims`
   或候选耗尽。未配置上限的域名永远不跳过。
 - **占用名额的租约**必须同时满足：`completed_at IS NULL`（未凭令牌完成）、
-  `lease_expires_at > 当前时刻`（未到期）、`delivery_attempts` 中尚不存在
+  `lease_expires_at > 当前时刻`（未到期，与领取、令牌完成使用同一时间基点与
+  微秒精度，见章节 22.2）、`delivery_attempts` 中尚不存在
   序号 ≥ 租约序号的回执（未被既有回执接口抢先取代）、且所属终点**未被撤销**。
 - **名额在下列时刻立即释放**（无需任何额外操作，下次领取即可见）：
   1. 凭令牌 `POST /deliveries/claims/{token}/complete` 成功写入回执（租约结束）；

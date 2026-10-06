@@ -567,6 +567,81 @@ def test_superseded_lease_reclaim_uses_latest_receipt_attempt(client):
     assert tasks[0]["token"] != old["token"]
 
 
+# ---------- 租约到期点按实际领取时刻 + 租约秒数确定（秒末领取不提前到期） ----------
+
+# 固定的“秒末”领取时刻（.900 秒处）：1 秒租约应到 .900+1s 才到期；
+# 旧实现按秒截断会在约 0.1 秒后就判 expired、提前允许重领并释放域名名额。
+CLAIM_AT_SECOND_END = datetime(2030, 1, 1, 0, 0, 0, 900000, tzinfo=timezone.utc)
+
+
+def claim_at(lease_seconds, moment, max_claims=100):
+    with db.transaction() as conn:
+        return store.claim_due_tasks(conn, max_claims, lease_seconds, now=moment)
+
+
+def complete_at(token, result, moment):
+    with db.transaction() as conn:
+        return store.complete_lease(conn, token, result, now=moment)
+
+
+def test_one_second_lease_at_second_end_does_not_expire_early(client):
+    # 回归：秒末（.9）领取 1 秒租约，约 0.2 秒后原令牌完成不得报 expired；
+    # 到期前同一终点不可重领；完成写入一次回执。
+    setup(client)
+    submit(client, "msg-1", "single@corp.example.com")  # carol 单终点
+    tasks = claim_at(1, CLAIM_AT_SECOND_END)
+    assert len(tasks) == 1
+    task = tasks[0]
+    # 到期点 = 实际领取时刻 + 1 秒（微秒精度，不做秒级截断）
+    assert task["lease_expires_at"] == "2030-01-01T00:00:01.900000+00:00"
+    # +0.2 秒（租约内）：同一终点不可重领
+    assert claim_at(1, CLAIM_AT_SECOND_END + timedelta(milliseconds=200)) == []
+    # +0.2 秒：原令牌仍有效，完成并写入一次回执
+    attempt = complete_at(task["token"], "delivered", CLAIM_AT_SECOND_END + timedelta(milliseconds=200))
+    assert attempt["attempt_no"] == 1 and attempt["result"] == "delivered"
+    ep = client.get("/deliveries/msg-1/receipts").json()["endpoints"][0]
+    assert [a["result"] for a in ep["attempts"]] == ["delivered"]
+
+
+def test_one_second_lease_reclaim_only_after_true_expiry(client):
+    # 到期前（+0.8 秒）不可重领；到期后（+1.2 秒）原令牌报 expired 且不写回执，
+    # 终点可重领并轮换令牌（旧令牌随即变为 unknown）。
+    setup(client)
+    submit(client, "msg-1", "single@corp.example.com")
+    old = claim_at(1, CLAIM_AT_SECOND_END)[0]
+    assert claim_at(1, CLAIM_AT_SECOND_END + timedelta(milliseconds=800)) == []
+    with pytest.raises(store.InvalidLeaseToken) as excinfo:
+        complete_at(old["token"], "delivered", CLAIM_AT_SECOND_END + timedelta(milliseconds=1200))
+    assert excinfo.value.reason == "expired"
+    summary = client.get("/deliveries/msg-1/receipts").json()
+    assert all(e["attempts"] == [] for e in summary["endpoints"])  # 无效令牌未写入回执
+    tasks = claim_at(1, CLAIM_AT_SECOND_END + timedelta(milliseconds=1200))
+    assert len(tasks) == 1 and tasks[0]["token"] != old["token"]
+    with pytest.raises(store.InvalidLeaseToken) as excinfo:
+        complete_at(old["token"], "delivered", CLAIM_AT_SECOND_END + timedelta(milliseconds=1300))
+    assert excinfo.value.reason == "unknown"  # 行已轮换
+
+
+def test_domain_in_flight_slot_held_until_true_expiry(client):
+    # 域名在途计数使用相同的有效期判断：秒末领取的 1 秒租约在 +0.2 秒时仍占
+    # 名额（同域下一任务被跳过），真正到期后才释放。
+    setup(client)
+    assert client.put("/deliveries/claims/domain-limits",
+                      json={"domain": "mail.example.com", "max_in_flight": 1}).status_code == 200
+    try:
+        submit(client, "msg-1")  # alice, bob（同域）
+        first = claim_at(1, CLAIM_AT_SECOND_END)
+        assert [t["mailbox"] for t in first] == ["alice@mail.example.com"]
+        # +0.2 秒（租约内）：alice 的租约仍占名额，bob 不可领
+        assert claim_at(1, CLAIM_AT_SECOND_END + timedelta(milliseconds=200)) == []
+        # +1.2 秒（已过期）：名额释放，alice 到期重领（同尝试序号 1，令牌轮换）
+        tasks = claim_at(1, CLAIM_AT_SECOND_END + timedelta(milliseconds=1200))
+        assert [t["mailbox"] for t in tasks] == ["alice@mail.example.com"]
+        assert tasks[0]["token"] != first[0]["token"] and tasks[0]["attempt_no"] == 1
+    finally:
+        client.delete("/deliveries/claims/domain-limits/mail.example.com")
+
+
 # ---------- 与既有功能解耦：查询、重放、熔断不受影响 ----------
 
 def test_claims_do_not_change_decisions_or_replay(client):

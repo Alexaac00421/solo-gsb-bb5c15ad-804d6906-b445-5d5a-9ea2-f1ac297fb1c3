@@ -890,6 +890,11 @@ def receipt_summary(conn: sqlite3.Connection, delivery_id: str) -> dict | None:
 # 不返回，到期后重领并轮换令牌），避免长期租约把已被直接回执取代的重试拖延
 # 到旧租约期满。全部“核对 + 写入”在单个 BEGIN IMMEDIATE 事务内完成，
 # 并发领取串行化，同一终点的有效租约不会被重复分配。
+#
+# 租约到期点按“实际领取时刻 + 请求的租约秒数”以微秒精度确定与比较：
+# 秒级截断会让在秒末领取的短租约提前到期（如 1 秒租约在秒末领取时实际只
+# 生效零头，约 0.2 秒后令牌即报 expired、终点被提前重领、域名在途名额被
+# 提前释放）。领取排除、域名在途计数与令牌完成三处使用同一时间基点与精度。
 
 
 def backoff_delay_seconds(attempt_no: int) -> int:
@@ -930,7 +935,10 @@ def claim_due_tasks(
     返回空列表。
     """
     current = now or datetime.now(timezone.utc)
-    now_text = current.isoformat(timespec="seconds")
+    # 微秒精度的同一时间基点：既用于下面两处“有效租约 / 在途占用”的 SQL 比较，
+    # 也用于写入 leased_at 与计算租约到期点。不能用秒级截断——在秒末领取时
+    # 截断会把有效期起点提前近 1 秒，短租约随即被误判为已到期。
+    now_text = current.isoformat(timespec="microseconds")
 
     # 成功判定的全部终点 × 该终点最新（序号最大）回执（无回执则最新侧为 NULL）；
     # 已有有效租约（未结束、未到期且未被不早于租约序号的回执取代）的终点与已撤销
@@ -1027,9 +1035,10 @@ def claim_due_tasks(
         ).fetchall()
         in_flight = {row["domain"]: row["n"] for row in occupancy_rows}
 
-    lease_expires_at = current + timedelta(seconds=lease_seconds)
+    # 到期点 = 实际领取时刻 + 请求的租约秒数，保留微秒（不做秒级截断），
+    # 与上面的 now_text 同一基点：1 秒租约在秒末领取也完整生效 1 秒。
+    expires_text = (current + timedelta(seconds=lease_seconds)).isoformat(timespec="microseconds")
     leased_at_text = now_text
-    expires_text = lease_expires_at.isoformat(timespec="seconds")
 
     # 按到期顺序依次领取：某域名已满额（事务开始时占用 + 本事务已领 >= 上限）时跳过
     # 其任务，继续领取后面其他域名的到期任务，直到凑满 max_claims 或候选耗尽。
@@ -1108,7 +1117,9 @@ def complete_lease(
         # 操作方已撤销该终点任务：既有租约立即失效，不得再写入新回执
         raise InvalidLeaseToken("revoked", token)
     current = now or datetime.now(timezone.utc)
-    if lease["lease_expires_at"] <= current.isoformat(timespec="seconds"):
+    # 按实际时刻比较（解析存储值，兼容旧库秒精度与新库微秒精度两种格式）：
+    # 到期点恰为当前时刻即视为已到期（> 才算有效），不再按秒截断提前判过期。
+    if _parse_utc(lease["lease_expires_at"]) <= current:
         raise InvalidLeaseToken("expired", token)
 
     last = get_last_attempt(conn, lease["delivery_id"], lease["mailbox"])
