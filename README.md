@@ -84,6 +84,10 @@
   到期（下一序号 +1）；最新回执为 `delivered` / `permanent_failure` 的终点**不再入列**；
   路由失败判定没有终点，从不入列。核对与领取在单个 `BEGIN IMMEDIATE` 事务内完成：
   **并发领取不会重复分配有效租约**；到期终点可被重新领取且**旧令牌立即失效**。
+  **租约到期点 = 实际领取时刻 + 请求的租约秒数**：`leased_at` / `lease_expires_at`
+  按微秒精度 UTC ISO 8601 存储与比较（到期点当刻视为过期），**到期前同一终点不可
+  重领、有效令牌可完成并恰好写入一次回执，到期后才允许重领并使旧令牌失效**——
+  不会因秒末领取被整秒截断而提前过期（详见章节 22.2）。
   **已被不早于租约序号的回执取代的租约行视为失效**：不再阻塞入列，该终点按最新回执
   重算到期时刻与下一尝试序号（退避未到不返回，到期即可重领并轮换令牌），不会把
   已被直接回执取代的重试拖延到旧租约期满。
@@ -931,8 +935,10 @@ curl -X POST http://localhost:8000/deliveries/claims -H 'Content-Type: applicati
 - `attempt_no`：**下一尝试序号**——无回执时为 `1`；最新回执为 `temporary_failure`
   （序号 N）时为 `N + 1`。
 - `due_at`：该终点本次的到期时刻（UTC ISO 8601）。
-- `lease_expires_at`：本次租约到期时刻（领取时刻 + `lease_seconds`）；
-  租约有效期内该终点不会再被分配给任何人。
+- `lease_expires_at`：本次租约到期时刻（**实际领取时刻 + `lease_seconds`**，
+  微秒精度 UTC ISO 8601，例 `2026-10-05T08:55:51.803039+00:00`）；
+  租约有效期内（到该时刻之前）该终点不会再被分配给任何人。到期判定以真实的
+  亚秒时刻为准，**不向下截到整秒**（见章节 22.2）。
 - `token`：租约令牌（32 位十六进制），完成回执时使用。
 - **暂无到期项** → `200 {"tasks": []}`；`max_claims` 或 `lease_seconds` 越界 / 缺失 → `422`。
 - 若管理员为**终点邮箱域名**配置了同时在途领取数上限，满额域名的任务会被跳过、继续领取
@@ -1080,6 +1086,56 @@ curl -X POST http://localhost:8000/deliveries/claims -H 'Content-Type: applicati
 #      "attempt_no": 2, "token": "a0f2db10…", ...}]}
 ```
 
+### 22.2 本轮变动：租约到期点按“实际领取时刻 + 请求秒数”确定（秒末短租约误过期修复）
+
+**问题**：领取与完成都把当前时刻截断到整秒。申请 1 秒租约若发生在某一秒的末段
+（如 `12:00:00.800`），真实到期点应是 `12:00:01.800`，但服务把到期点向下存成
+`12:00:01`：约 0.2 秒后（`12:00:01.000`）原令牌完成即被误判 `expired`，而此刻
+**同一终点已经可以被重新领取**（旧令牌被轮换），该终点邮箱域名的在途名额也被
+提前释放——与“到期前不可重领、有效令牌可完成”的语义不符。
+
+**修复**（请求 / 响应字段、409 `invalid_lease_token` 的 reason 语义、UTC ISO 8601
+时间格式均不变）：
+
+- `leased_at` / `lease_expires_at` 按**微秒精度**存储，到期点严格等于
+  **实际领取时刻 + 请求的 `lease_seconds`（1～3600 秒）**；领取扫描、令牌完成与
+  域名在途计数全部用同一亚秒精度的当前时刻比较（`lease_expires_at > now`，
+  到期点当刻视为已过期，边界规则与此前一致）。
+- **到期之前**：同一终点不可被重新领取；原令牌有效，可完成并**恰好写入一次**回执
+  （再次提交仍为 `409 completed`）；该租约继续占用其终点域名的在途名额。
+- **到期之后**：才允许重新领取，重领即轮换令牌使旧令牌失效（旧令牌完成报
+  `409 invalid_lease_token`：重领前 `expired`、重领后 `unknown`）；无效令牌不写回执。
+- 域名在途计数使用同一有效期判断：名额不再因整秒截断而提前释放；**完成**
+  （凭令牌成功回执）、**较新回执抢先取代**（`superseded`，无需等租约期满即释放）与
+  **撤销**（`revoked`）释放名额的既有规则完全保留。
+- `due_at` 与回执 `created_at` 仍为秒精度（退避以整秒计），只有租约有效期改为亚秒精度。
+
+调用示例（沿用上文判定；本例在某一秒约 0.800 处领取 1 秒租约）：
+
+```bash
+# 1) 申请 1 秒租约：lease_expires_at = 实际领取时刻 + 1s（含亚秒）
+curl -X POST http://localhost:8000/deliveries/claims -H 'Content-Type: application/json' \
+  -d '{"max_claims": 10, "lease_seconds": 1}'
+# => {"tasks": [{"delivery_id": "msg-demo", "mailbox": "carol@mail.example.com",
+#      "attempt_no": 1, "due_at": "2026-10-06T23:52:49+00:00",
+#      "lease_expires_at": "2026-10-06T23:52:50.803039+00:00",
+#      "token": "cb5b61bbc577c8f02fc2e4766089685b"}]}
+
+# 2) 到期前再次领取：同一终点不可重领（空列表）
+curl -X POST http://localhost:8000/deliveries/claims -H 'Content-Type: application/json' \
+  -d '{"max_claims": 10, "lease_seconds": 1}'
+# => {"tasks": []}
+
+# 3) 约 0.2 秒后原令牌完成：成功写入一次回执（旧实现在此误报 expired）
+curl -X POST http://localhost:8000/deliveries/claims/cb5b61bbc577c8f02fc2e4766089685b/complete \
+  -H 'Content-Type: application/json' -d '{"result": "delivered"}'
+# => {"delivery_id": "msg-demo", "mailbox": "carol@mail.example.com",
+#     "attempt_no": 1, "result": "delivered", "created_at": "2026-10-06T23:52:50+00:00"}
+
+# 4) 同一令牌再提交：409 completed，不重复写回执；无效令牌（expired/unknown/
+#    superseded/revoked）同样不写入任何回执
+```
+
 ## 按终点邮箱域名限制同时在途领取数
 
 为避免某个接收域（如某家邮件服务商）被同时打太多发信连接，管理员可以按**终点邮箱的域名**
@@ -1136,8 +1192,9 @@ curl -X DELETE http://localhost:8000/deliveries/claims/domain-limits/mail.exampl
   在途占用：**已满额的域名 → 跳过这一项，继续往后领取其他域名**，直到凑满 `max_claims`
   或候选耗尽。未配置上限的域名永远不跳过。
 - **占用名额的租约**必须同时满足：`completed_at IS NULL`（未凭令牌完成）、
-  `lease_expires_at > 当前时刻`（未到期）、`delivery_attempts` 中尚不存在
-  序号 ≥ 租约序号的回执（未被既有回执接口抢先取代）、且所属终点**未被撤销**。
+  `lease_expires_at > 当前时刻`（未到期；与领取 / 完成使用同一亚秒精度有效期判断）、
+  `delivery_attempts` 中尚不存在序号 ≥ 租约序号的回执（未被既有回执接口抢先取代）、
+  且所属终点**未被撤销**。
 - **名额在下列时刻立即释放**（无需任何额外操作，下次领取即可见）：
   1. 凭令牌 `POST /deliveries/claims/{token}/complete` 成功写入回执（租约结束）；
   2. 到达 `lease_expires_at` 仍未回执（租约到期，该终点可被重新领取）；

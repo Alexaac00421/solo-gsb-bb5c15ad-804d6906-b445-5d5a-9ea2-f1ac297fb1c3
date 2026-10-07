@@ -123,6 +123,9 @@ CREATE TABLE IF NOT EXISTS delivery_attempts (
 -- 不再入列。每个 (delivery_id, mailbox) 至多一行：领取时插入，到期重领时整体轮换
 -- （新令牌、新序号，completed_at/result 复位），旧令牌立即失效；凭有效令牌提交回执时
 -- 原子写入 delivery_attempts 并把 completed_at 置位（结束租约）。
+-- leased_at / lease_expires_at 使用微秒精度 UTC ISO 8601：到期点 = 实际领取时刻 +
+-- 请求的租约秒数（1～3600），不向下截到整秒——否则秒末领取的短租约会提前至多 1 秒
+-- 被判过期、终点提前可重领、域名在途名额提前释放。
 -- 有效租约 = completed_at IS NULL 且 lease_expires_at > 当前时刻，且未被不早于
 -- 租约序号的回执（delivery_attempts 中 attempt_no >= 租约序号）取代——被取代的
 -- 租约行不再阻塞入列，该终点按最新回执重算到期时刻后即可重领；并发领取经

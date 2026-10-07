@@ -890,6 +890,13 @@ def receipt_summary(conn: sqlite3.Connection, delivery_id: str) -> dict | None:
 # 不返回，到期后重领并轮换令牌），避免长期租约把已被直接回执取代的重试拖延
 # 到旧租约期满。全部“核对 + 写入”在单个 BEGIN IMMEDIATE 事务内完成，
 # 并发领取串行化，同一终点的有效租约不会被重复分配。
+#
+# 租约的到期点 = 实际领取时刻（微秒精度）+ 请求的 lease_seconds：leased_at /
+# lease_expires_at 与全部“当前时刻”比较一律使用微秒精度 UTC ISO 8601 字符串——
+# 若把时刻截到整秒，秒末领取（如 xx:00.800 申请 1 秒）会把到期点提前至多 1 秒
+# （存成 xx:01，xx:01.000 即被判过期），导致有效令牌误报 expired、终点提前
+# 可重领、域名在途名额提前释放。到期 / 退避判定仍以整秒为单位（due_at 与回执
+# created_at 沿用秒精度），只是租约有效期不再向下截断。
 
 
 def backoff_delay_seconds(attempt_no: int) -> int:
@@ -927,10 +934,12 @@ def claim_due_tasks(
     每项返回投递编号、终点、下一尝试序号、到期时刻、租约到期时刻与租约令牌。
     到期时刻与下一尝试序号一律按该终点最新回执重算；已被不早于租约序号的
     回执取代的租约行视为失效，不再阻塞入列（退避未到仍不返回）。暂无到期项
-    返回空列表。
+    返回空列表。租约到期点 = 实际领取时刻 + lease_seconds，按微秒精度存储与
+    比较（见模块注释），不会因秒末截断而提前到期。
     """
     current = now or datetime.now(timezone.utc)
-    now_text = current.isoformat(timespec="seconds")
+    # 租约有效期的核对使用微秒精度：领取发生在秒末时，到期点不被向下截到整秒。
+    now_text = current.isoformat(timespec="microseconds")
 
     # 成功判定的全部终点 × 该终点最新（序号最大）回执（无回执则最新侧为 NULL）；
     # 已有有效租约（未结束、未到期且未被不早于租约序号的回执取代）的终点与已撤销
@@ -1029,7 +1038,7 @@ def claim_due_tasks(
 
     lease_expires_at = current + timedelta(seconds=lease_seconds)
     leased_at_text = now_text
-    expires_text = lease_expires_at.isoformat(timespec="seconds")
+    expires_text = lease_expires_at.isoformat(timespec="microseconds")
 
     # 按到期顺序依次领取：某域名已满额（事务开始时占用 + 本事务已领 >= 上限）时跳过
     # 其任务，继续领取后面其他域名的到期任务，直到凑满 max_claims 或候选耗尽。
@@ -1093,8 +1102,10 @@ def complete_lease(
     （revoked），既有租约立即失效且不得再写入回执；若既有回执接口先为该终点
     记录了 attempt_no >= 租约序号的新回执 → InvalidLeaseToken（superseded），
     令牌失效且不得覆盖。校验通过则原子写入 delivery_attempts（结果只增不改的
-    既有约定不变）并把租约标记为已结束。
+    既有约定不变）并把租约标记为已结束。到期点按实际领取时刻 + 请求秒数的
+    微秒精度比较（见模块注释）：秒末领取的短租约在其真实到期点之前仍有效。
     """
+    current = now or datetime.now(timezone.utc)
     lease = conn.execute(
         "SELECT token, delivery_id, mailbox, attempt_no, leased_at, lease_expires_at, "
         "completed_at, result FROM endpoint_leases WHERE token = ?",
@@ -1107,8 +1118,9 @@ def complete_lease(
     if is_endpoint_revoked(conn, lease["delivery_id"], lease["mailbox"]):
         # 操作方已撤销该终点任务：既有租约立即失效，不得再写入新回执
         raise InvalidLeaseToken("revoked", token)
-    current = now or datetime.now(timezone.utc)
-    if lease["lease_expires_at"] <= current.isoformat(timespec="seconds"):
+    # 解析存储的微秒精度到期点与当前时刻严格比较（== 到期点视为已过期），
+    # 不把当前时刻向下截到整秒，避免秒末领取的租约在真实到期点之前被判过期。
+    if _parse_utc(lease["lease_expires_at"]) <= current:
         raise InvalidLeaseToken("expired", token)
 
     last = get_last_attempt(conn, lease["delivery_id"], lease["mailbox"])
